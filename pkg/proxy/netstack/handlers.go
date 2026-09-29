@@ -217,6 +217,8 @@ func HandlePacket(nstack *stack.Stack, localConn TunConn, yamuxConn *yamux.Sessi
 	yamuxConnectionSession, err := yamuxConn.Open()
 	if err != nil {
 		logrus.Error(err)
+		// Release the in-flight slot and RST the client; a failed Open leaks it.
+		localConn.Terminate(true)
 		return
 	}
 	connectPacket := protocol.ConnectRequestPacket{
@@ -233,6 +235,7 @@ func HandlePacket(nstack *stack.Stack, localConn TunConn, yamuxConn *yamux.Sessi
 	if err := protocolEncoder.Encode(connectPacket); err != nil {
 		logrus.Error(err)
 		_ = yamuxConnectionSession.Close()
+		localConn.Terminate(true)
 		return
 	}
 
@@ -242,6 +245,7 @@ func HandlePacket(nstack *stack.Stack, localConn TunConn, yamuxConn *yamux.Sessi
 			logrus.Error(err)
 		}
 		_ = yamuxConnectionSession.Close()
+		localConn.Terminate(true)
 		return
 	}
 
@@ -249,6 +253,7 @@ func HandlePacket(nstack *stack.Stack, localConn TunConn, yamuxConn *yamux.Sessi
 	if err != nil {
 		logrus.Error(err)
 		_ = yamuxConnectionSession.Close()
+		localConn.Terminate(true)
 		return
 	}
 	if reply.Established {
@@ -264,6 +269,8 @@ func HandlePacket(nstack *stack.Stack, localConn TunConn, yamuxConn *yamux.Sessi
 					return
 				}
 				gonetConn := gonet.NewTCPConn(&wq, ep)
+				// Handshake done: release the in-flight slot, no RST.
+				localConn.Terminate(false)
 				go relay.StartRelay(yamuxConnectionSession, gonetConn)
 
 			} else if localConn.IsUDP() {

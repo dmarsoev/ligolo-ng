@@ -24,6 +24,7 @@ import (
 	"net"
 	"os"
 	"os/user"
+	"sync"
 	"syscall"
 	"time"
 
@@ -36,6 +37,9 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// stateMu guards the reverse-listener bookkeeping below; without it concurrent
+// map writes from the HandleConn and ListenAndServe goroutines crash the agent.
+var stateMu sync.Mutex
 var listenerConntrack map[int32]net.Conn
 var listenerMap map[int32]interface{}
 var connTrackID int32
@@ -46,6 +50,53 @@ func init() {
 	listenerConntrack = make(map[int32]net.Conn)
 	listenerMap = make(map[int32]interface{})
 	sessionID = hex.EncodeToString(uuid.NodeID())
+}
+
+// registerConn stores a connection under a fresh id and returns it. The store
+// happens before the id is published so a racing lookup always finds it.
+func registerConn(conn net.Conn) int32 {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	connTrackID++
+	id := connTrackID
+	listenerConntrack[id] = conn
+	return id
+}
+
+// getConn returns the tracked connection for id, and whether it was present.
+func getConn(id int32) (net.Conn, bool) {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	conn, ok := listenerConntrack[id]
+	return conn, ok
+}
+
+// deleteConn removes a tracked connection.
+func deleteConn(id int32) {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	delete(listenerConntrack, id)
+}
+
+// registerListener stores a listener under a fresh id and returns that id.
+func registerListener(l interface{}) int32 {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	id := listenerID
+	listenerID++
+	listenerMap[id] = l
+	return id
+}
+
+// takeListener removes and returns the listener for id, and whether it existed.
+func takeListener(id int32) (interface{}, bool) {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	l, ok := listenerMap[id]
+	if ok {
+		delete(listenerMap, id)
+	}
+	return l, ok
 }
 
 // Listener is the base class implementing listener sockets for Ligolo
@@ -69,9 +120,7 @@ func (s *Listener) ListenAndServe(connTrackChan chan int32) error {
 		if err != nil {
 			return err
 		}
-		connTrackID++
-		connTrackChan <- connTrackID
-		listenerConntrack[connTrackID] = conn
+		connTrackChan <- registerConn(conn)
 	}
 }
 
@@ -100,6 +149,16 @@ func NewUDPListener(network string, addr string) (UDPListener, error) {
 }
 
 func HandleConn(conn net.Conn) {
+	// Close the stream on return, or the proxy's FIN leaves it half-closed and
+	// never reaped, leaking a stream per failed probe. Branches that hand conn
+	// to a background relay set handoff = true to keep ownership.
+	handoff := false
+	defer func() {
+		if !handoff {
+			_ = conn.Close()
+		}
+	}()
+
 	decoder := protocol.NewDecoder(conn)
 	if err := decoder.Decode(); err != nil {
 		logrus.Error(err)
@@ -209,15 +268,14 @@ func HandleConn(conn net.Conn) {
 		encoder := protocol.NewEncoder(conn)
 
 		var err error
-		if lis, ok := listenerMap[closeRequest.ListenerID]; ok {
+		// takeListener removes the entry under lock; close outside the lock.
+		if lis, ok := takeListener(closeRequest.ListenerID); ok {
 			if l, ok := lis.(net.Listener); ok {
 				l.Close()
 			}
 			if l, ok := lis.(*net.UDPConn); ok {
 				l.Close()
 			}
-			// Remove closed listener from map to avoid leaks
-			delete(listenerMap, closeRequest.ListenerID)
 		} else {
 			err = errors.New("invalid listener id")
 		}
@@ -252,9 +310,9 @@ func HandleConn(conn net.Conn) {
 				}
 				return
 			}
-			listenerMap[listenerID] = listener.Listener
+			id := registerListener(listener.Listener)
 			listenerResponse := protocol.ListenerResponsePacket{
-				ListenerID: listenerID,
+				ListenerID: id,
 				Err:        false,
 				ErrString:  "",
 			}
@@ -281,15 +339,17 @@ func HandleConn(conn net.Conn) {
 				}
 				return
 			}
-			listenerMap[listenerID] = udplistener.UDPConn
+			id := registerListener(udplistener.UDPConn)
 			listenerResponse := protocol.ListenerResponsePacket{
-				ListenerID: listenerID,
+				ListenerID: id,
 				Err:        false,
 				ErrString:  "",
 			}
 			if err := encoder.Encode(listenerResponse); err != nil {
 				logrus.Error(err)
 			}
+			// The relay goroutine owns conn and closes it itself.
+			handoff = true
 			go func() {
 				err := relay.StartUDPListenerRelay(conn, udplistener.UDPConn)
 				if err != nil {
@@ -298,7 +358,6 @@ func HandleConn(conn net.Conn) {
 			}()
 		}
 
-		listenerID++
 		if listenRequest.Network == "tcp" {
 			for {
 				var bindResponse protocol.ListenerBindReponse
@@ -331,7 +390,8 @@ func HandleConn(conn net.Conn) {
 		socketEncDec := protocol.NewEncoderDecoder(conn)
 
 		var sockResponse protocol.ListenerSockResponsePacket
-		if _, ok := listenerConntrack[sockRequest.SockID]; !ok {
+		netConn, ok := getConn(sockRequest.SockID)
+		if !ok {
 			// Handle error
 			sockResponse.ErrString = "invalid or unexistant SockID"
 			sockResponse.Err = true
@@ -350,20 +410,19 @@ func HandleConn(conn net.Conn) {
 			logrus.Error(err)
 			return
 		}
-		netConn := listenerConntrack[sockRequest.SockID]
 
 		ready, err := protocol.PayloadAs[protocol.ListenerSocketConnectionReady](socketEncDec.Payload)
 		if err != nil {
 			logrus.Error(err)
 			netConn.Close()
-			delete(listenerConntrack, sockRequest.SockID)
+			deleteConn(sockRequest.SockID)
 			return
 		}
 
 		if err := ready.Err; err != false {
 			logrus.Debug("Socket relay session failed: error from proxy")
 			netConn.Close()
-			delete(listenerConntrack, sockRequest.SockID)
+			deleteConn(sockRequest.SockID)
 			return
 		}
 
@@ -372,7 +431,7 @@ func HandleConn(conn net.Conn) {
 			logrus.Error(err)
 		}
 		netConn.Close()
-		delete(listenerConntrack, sockRequest.SockID)
+		deleteConn(sockRequest.SockID)
 
 	case *protocol.AgentKillRequestPacket:
 		os.Exit(0)
